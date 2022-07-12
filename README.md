@@ -6,11 +6,11 @@ Checking the power status of all nodes or powering them down via IPMI is a strai
 
 Powering all nodes on is a slightly more difficult procedure.  Our clusters use the PERCEUS/Warewulf provisioning system, and some of the VNFS images are rather large.  Booting all 200+ nodes at the same time, some of the nodes will inevitably end up waiting for the VNFS image and probably timing-out before they are able to download it.  On older clusters we also found that dhcpd had trouble servicing all of the overlapping DHCP requests in a timely fashion.  To mitigate these issues, the utility attempts to boot *N* nodes at a time:
 
-- *M* = 0
+- active list = empty list
 - While there are hosts left to boot:
     - Note timestamp, t0
     - Does the active list NOT contain *N* hosts?
-        - *(N - M)* nodes are powered-on
+        - *(N - len(active list))* nodes are powered-on
         - Any nodes that fail ping or IPMI are unreachable, summarize and DO NOT add to active list...
         - ...otherwise the key-value pair hostname : timestamp is added to the active list
     - Does the active list contain any hosts?
