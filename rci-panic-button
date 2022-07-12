@@ -1,0 +1,295 @@
+#!/usr/bin/env python
+#
+# Parallel power mgmt of all compute nodes.
+#
+# All changes per-cluster should be able to be implemented sheerly by
+# altering the contents of the Config class.
+#
+
+import sys
+import errno
+import time
+import random
+import argparse
+import subprocess
+from multiprocessing.dummy import Pool
+
+try:
+    DEVNULL = subprocess.DEVNULL
+except:
+    try:
+        DEVNULL = subprocess.FNULL
+    except:
+        DEVNULL = open('/dev/null', 'w')
+
+class Config:
+
+    # Confirmation phrases:
+    ConfirmationPhrases = [
+            'the dark side clouds everything',
+            'i do not fear the dark side as you do',
+            'may the force be with you',
+            'try not do or do not there is no try',
+            'fear is the path to the dark side',
+            'luminous beings are we not this crude matter',
+            'your focus determines your reality',
+            'the ability to speak does not make you intelligent',
+            'always in motion is the future',
+            'you will never find a more wretched hive of scum and villainy',
+            'in my experience theres no such thing as luck',
+            'id just as soon kiss a wookiee',
+            'these arent the droids youre looking for',
+            'i find your lack of faith disturbing',
+            'so this is how liberty dies with thunderous applause'
+        ]
+
+    # Command that generates a whitespace-delimited list of
+    # node hostnames:
+    HostlistCmd = ['/usr/local/bin/rci-nodelist']
+    
+    # Ping command:
+    Ping = '/bin/ping'
+    
+    # IPMITOOL command:
+    IPMITool = '/usr/bin/ipmitool'
+    
+    # NCAT command:
+    NCat = '/bin/ncat'
+    
+    # Maximum number of subprocesses to run in parallel:
+    MaxProcessCount = 20
+    
+    # Power on stride -- how many to start at a time (0 => no limit):
+    MaxBootupStride = 20
+    
+    # Maximum time to wait for each group of nodes to power on (in seconds):
+    MaxBootupWaitTime = 10 * 60
+    
+    # Minimum time for each status check during MaxBootupWaitTime (in seconds):
+    MinBootupStrideTime = 30
+    
+    @classmethod
+    def IPMIHostname(cls, IPMIHost):
+        # This function returns the IPMI interface hostname associated with the
+        # IPMIHost.  E.g. on our clusters the IMPI network port is named with
+        # a '-ipmi' suffix on the regular hostname.
+        return IPMIHost + '-ipmi'
+    
+    @classmethod
+    def IPMIUserName(cls, IPMIHost):
+        # This function returns the IPMI user name for the given IPMIHost.
+        return 'ADMIN'
+    
+    @classmethod
+    def IPMIPassword(cls, IPMIHost):
+        # This function returns the IPMI user password for the given IPMIHost.
+        return 'my_password_is_unsafe'
+
+
+#
+# Test if the host responds to ssh connections:
+#
+def try_ssh(nodename):
+    rc = 0
+    try:
+        ncat_cmd = subprocess.Popen([Config.NCat, nodename, '22'], stdout=DEVNULL, stderr=DEVNULL, cwd='/tmp')
+        out,err = ncat_cmd.communicate()
+        rc = ncat_cmd.returncode
+    except Exception as err:
+        rc = -1
+    return nodename, rc
+
+
+#
+# The action to perform:
+#
+def powerfn(argv):
+    nodename, mode = argv
+    rc = 0
+    status = ''
+    try:
+        ping_cmd = subprocess.Popen([Config.Ping, '-c1' , '-i1', Config.IPMIHostname(nodename)], stdout=DEVNULL, stderr=DEVNULL, cwd='/tmp')
+        rc = ping_cmd.wait()
+        if rc == 0:
+            ipmi_cmd = subprocess.Popen([Config.IPMITool, '-I', 'lanplus', '-U', Config.IPMIUserName(nodename), '-P', Config.IPMIPassword(nodename), '-H', Config.IPMIHostname(nodename), 'power', mode], stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd='/tmp')
+            stdout_str, stderr_str = ipmi_cmd.communicate()
+            if ipmi_cmd.returncode == 0:
+                status = 'SUCCESS ({0:s})'.format(stdout_str.strip())
+            else:
+                errmsg = stderr_str.strip().replace('\n', '; ')
+                status = 'FAILED ({0:s}, rc = {1:d}, stderr={2:s})'.format(Config.IPMITool, ipmi_cmd.returncode, errmsg)
+        else:
+            status = 'FAILED ({0:s}, rc = {1:d})'.format(Config.Ping, rc)
+    except Exception as err:
+        status = 'FAILED (' + str(err) + ')'
+    return nodename, status
+
+
+#
+# The main function:
+#
+def main(nprocs=1, mode='status'):
+    #
+    # Generate the list of hosts:
+    #
+    hostlist = None
+    try:
+        hostlist_cmd = subprocess.Popen(Config.HostlistCmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, cwd='/tmp')
+        hostlist_stdout, hostlist_stderr = hostlist_cmd.communicate()
+        hostlist = hostlist_stdout.split()
+        if hostlist_cmd.returncode != 0:
+            print("WARNING:  hostlist generator command returned code {0:d} and {1:d} hosts".format(hostlist_cmd.returncode, len(hostlist)))
+        else:
+            print("INFO:     hostlist generator command returned {0:d} hosts".format(len(hostlist)))
+    except Exception as err:
+        print('ERROR:    hostlist generator command failed: {0:s}'.format(str(err)))
+
+    if hostlist:
+        cmd_pool = Pool(processes=nprocs)
+        if mode in ('up', 'on') and Config.MaxBootupStride > 0:
+            #
+            # This loop will attempt to keep Config.MaxBootupStride hosts
+            # in the pipeline, doing a power-on and then checking for ssh
+            # to answer.  Each host will have Config.MaxBootupWaitTime seconds
+            # to answer after the power-on.  If a host does not respond to
+            # the power-on, its status is FAILED and it leaves the active
+            # list.  Once a host responds to ssh, its status is SUCCESS and
+            # it leaves the active list.  Once a host's time limit is up,
+            # its status is FAILED and it leaves the list.  On each iteration
+            # new hosts are powered-on to fill the active list to 
+            # Config.MaxBootupStride hosts.
+            #
+            active = {}
+            iter_num = 0
+            ts = time.time()
+            while len(hostlist) > 0:
+                iter_num = iter_num + 1
+                
+                # Start the per-iteration timer:
+                t0 = time.time()
+                print('{0:20s}Iteration {1:d} started with {2:d} hosts in active state'.format('', iter_num, len(active)))
+                
+                # Are there any openings in the active list?  If so, fill them
+                # now:
+                add_count = Config.MaxBootupStride - len(active)
+                if add_count > 0:
+                    did_add_count = 0
+                    for nodename, status in cmd_pool.imap_unordered(powerfn, zip(hostlist[0:add_count], [mode]*add_count)):
+                        if 'SUCCESS' in status:
+                            active[nodename] = time.time()
+                            did_add_count = did_add_count + 1
+                        else:
+                            print('{0:<20s}  {1:s}'.format(nodename, status))
+                    hostlist = hostlist[add_count:]
+                    print('{0:20s}Iteration {1:d} added {2:d} hosts to active state'.format('', iter_num, did_add_count))
+                    
+                
+                if len(active) > 0:
+                    # Now we'll try ssh'ing to all of the active hosts:
+                    active_nodenames = list(active.keys())
+                    for nodename, rc in cmd_pool.imap_unordered(try_ssh, active_nodenames):
+                        if rc == 0:
+                            print('{0:<20s}  {1:s}'.format(nodename, 'SUCCESS (powered on, answers to ssh)'))
+                            del(active[nodename])
+                        elif (time.time() - active[nodename]) >= Config.MaxBootupWaitTime:
+                            print('{0:<20s}  {1:s}'.format(nodename, 'FAILED (no response to ssh)'))
+                            del(active[nodename])
+                
+                    if len(active) > 0:
+                        # Make sure we take AT LEAST Config.MinBootupStrideTime seconds to
+                        # get through an iteration if there are hosts we are still checking
+                        # (present in active list):
+                        t1 = time.time()
+                        if (t1 - t0) < Config.MinBootupStrideTime:
+                            time.sleep(Config.MinBootupStrideTime - (t1 - t0))
+                
+                
+            print('{0:20s}Completed in {1:d} iterations lasting {2:.1f} seconds'.format('', iter_num, time.time() - ts))
+                
+        else:
+            #
+            # Run the commands in parallel:
+            #
+            for nodename, status in cmd_pool.imap_unordered(powerfn, zip(hostlist, [mode]*len(hostlist))):
+                print('{0:<20s}  {1:s}'.format(nodename, status))
+        
+
+if __name__ == '__main__':
+    #
+    # Check for any cli arguments:
+    #
+    cli_parser = argparse.ArgumentParser(description='Attempt to manage power of all compute nodes.')
+    cli_parser.add_argument('mode',
+            nargs='?',
+            choices=['status', 'down', 'up', 'off', 'on'],
+            default='status',
+            help='Operation to perform (default: status)'
+        )
+    cli_parser.add_argument('--nprocs', '-N', metavar='#',
+            dest='nprocs',
+            type=int,
+            default=Config.MaxProcessCount,
+            help='Maximum number of parallel processes to use'
+        )
+    cli_parser.add_argument('--yes', '-y',
+            dest='is_confirmed',
+            default=False,
+            action='store_true',
+            help='Initial confirmation that you do indeed want to affect the compute nodes'
+        )
+    cli_parser.add_argument('--bootup-stride', '-s', metavar='#',
+            dest='bootup_stride',
+            type=int,
+            default=None,
+            help='Number of nodes to power-on concurrently (0 implies all at once, default {0:d})'.format(Config.MaxBootupStride)
+        )
+    cli_parser.add_argument('--bootup-max-wait', '-w', metavar='<seconds>',
+            dest='bootup_max_wait',
+            type=int,
+            default=None,
+            help='Maximum amount of time to wait for a powered-on node to answer to ssh (default {0:d} seconds)'.format(Config.MaxBootupWaitTime)
+        )
+    cli_parser.add_argument('--bootup-min-check', '-m', metavar='<seconds>',
+            dest='bootup_min_check',
+            type=int,
+            default=None,
+            help='Minimum amount of time each bootup iteration should take (limits how fast status is rechecked and new hosts started, default {0:d} seconds)'.format(Config.MinBootupStrideTime)
+        )
+    cli_args = cli_parser.parse_args()
+    if not cli_args.is_confirmed:
+        print("WARNING:  you didn't say --yes/-y, so you must not really want to do this")
+    else:
+        print("INFO:     running in {0:s} mode".format(cli_args.mode.upper()))
+        
+        if cli_args.bootup_stride is not None:
+            Config.MaxBootupStride = cli_args.bootup_stride
+        if cli_args.bootup_max_wait is not None:
+            Config.MaxBootupWaitTime = cli_args.bootup_max_wait
+        if cli_args.bootup_min_check is not None:
+            Config.MinBootupStrideTime = cli_args.bootup_min_check
+            
+        if Config.MaxBootupWaitTime < Config.MinBootupStrideTime:
+            print("ERROR:  the maximum time to monitor booted hosts is less than the minimum loop")
+            print("        time, so it's likely you'll miss completed bootups.  Please fix.")
+            sys.exit(errno.EINVAL)
+        
+        should_proceed = True
+        if cli_args.mode != 'status':
+            #
+            # Pick a random phrase:
+            #
+            random.seed()
+            phrase = Config.ConfirmationPhrases[random.randint(1, len(Config.ConfirmationPhrases)) - 1]
+            print("INFO:     Please type the following phrase verbatim to confirm your intention to")
+            print("          POWER {0:s} all compute nodes in the cluster:".format(cli_args.mode.upper()))
+            print("")
+            print("TYPE:     " + phrase);
+            typed = raw_input("        > ")
+            if typed == phrase:
+                print("INFO:     congratulations, you typed the phrase properly and indicated you really")
+                print("          want to affect all the compute nodes...proceeding with that action now")
+            else:
+                print("ERROR:    you did not enter the phrase properly, guess you are not serious")
+                should_proceed = False
+        if should_proceed:
+            main(nprocs=cli_args.nprocs, mode=cli_args.mode)
